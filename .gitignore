@@ -1,0 +1,14 @@
+# Clasp設定ファイル
+.clasp.json
+
+# 一時ファイル
+*.tmp
+*.log
+
+# OS生成ファイル
+.DS_Store
+Thumbs.db
+
+# 個人設定ファイル
+config.local.js
+secrets.json
