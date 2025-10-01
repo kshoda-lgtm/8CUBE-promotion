@@ -46,27 +46,41 @@ function processJSONFiles() {
 }
 
 /**
- * Google Drive上のJSONファイルを検索
+ * Google Drive上のJSONファイルを検索（修正版）
  */
 function findJSONFiles() {
   try {
-    // 特定フォルダまたは全体からJSONファイルを検索
-    const files = DriveApp.searchFiles(
-      'name contains ".json" and mimeType = "application/json"'
-    );
+    console.log('🔍 JSONファイル検索開始...');
+
+    // 全てのファイルから.jsonで終わるファイルを検索
+    const files = DriveApp.getFiles();
 
     const jsonFiles = [];
     while (files.hasNext()) {
       const file = files.next();
-      // PowerPoint由来のJSONファイルのみ対象
-      if (file.getName().includes('powerpoint') ||
-          file.getName().includes('pptx') ||
-          file.getName().includes('presentation')) {
-        jsonFiles.push(file);
+      const fileName = file.getName();
+
+      // .jsonで終わるファイルのみ
+      if (!fileName.endsWith('.json')) {
+        continue;
       }
+
+      console.log(`📄 発見したファイル: ${fileName}`);
+
+      // _batch_summary.jsonは除外
+      if (fileName.includes('_batch_summary')) {
+        console.log(`  ⏭️  スキップ: サマリーファイル`);
+        continue;
+      }
+
+      // .jsonファイルは全て対象
+      jsonFiles.push(file);
+      console.log(`  ✅ 追加: ${fileName}`);
     }
 
+    console.log(`📊 合計 ${jsonFiles.length} 個のJSONファイルを検出`);
     return jsonFiles;
+
   } catch (error) {
     console.error('❌ JSONファイル検索エラー:', error);
     return [];
@@ -107,37 +121,80 @@ function processJSONFile(file, sheet, fileNumber) {
 }
 
 /**
- * JSONデータから情報を抽出
+ * JSONデータから情報を抽出（Gemini API版対応）
  */
 function extractInfoFromJSON(data) {
-  const summary = data.summary || {};
+  // Gemini API版とレガシー版の両方に対応
+  const analysis = data.gemini_analysis || data.summary || {};
   const fileInfo = data.file_info || {};
 
-  // 価格情報の処理
+  // Gemini API版の場合
+  if (data.gemini_analysis) {
+    const g = analysis;
+
+    // ファイル名からクライアント名を抽出（フォールバック）
+    const clientFromFilename = extractClientFromFilename(fileInfo.file_name || '');
+
+    // 協力会社リストの処理
+    const companies = (g.partner_companies || []).filter(c => c && c.length > 0);
+    const mainCompany = companies.length > 0 ? companies[0] : '';
+
+    // ノベルティリストの処理
+    const novelties = (g.novelty_items || []).filter(n => n && n.length > 0);
+    const mainNovelty = novelties.length > 0 ? novelties[0] : '';
+
+    // キーワードリストの処理
+    const keywords = (g.keywords || []).filter(k => k && k.length > 0);
+    const tags = keywords.join(', ');
+
+    return {
+      fileName: fileInfo.file_name || '',
+      slideCount: fileInfo.slide_count || 0,
+      processedAt: fileInfo.processed_at || new Date().toISOString(),
+      eventType: g.event_type || '',
+      eventDate: g.event_date || '',
+      mainClient: g.client_name || clientFromFilename,
+      mainCompany: mainCompany,
+      allCompanies: companies.join(', '),
+      avgPrice: g.unit_price || null,
+      minPrice: g.unit_price || null,
+      maxPrice: g.unit_price || null,
+      totalQuantity: g.order_quantity || null,
+      totalCost: g.total_cost || null,
+      targetCount: g.target_count || null,
+      mainDeadline: g.deadline || '',
+      mainNovelty: mainNovelty,
+      venue: g.venue || '',
+      eventDescription: g.event_description || '',
+      tags: tags,
+      slideTexts: data.slide_texts_sample || '',
+      confidenceScore: g.confidence_score || 0
+    };
+  }
+
+  // レガシー版（後方互換性）
+  const summary = analysis;
   const prices = summary.all_prices || [];
   const avgPrice = prices.length > 0 ?
     Math.round(prices.reduce((a, b) => a + b, 0) / prices.length) : null;
-  const minPrice = prices.length > 0 ? Math.min(...prices) : null;
-  const maxPrice = prices.length > 0 ? Math.max(...prices) : null;
-
-  // 数量情報の処理
   const quantities = summary.all_quantities || [];
   const totalQuantity = quantities.length > 0 ?
     quantities.reduce((a, b) => a + b, 0) : null;
-
-  // 会社情報
-  const companies = summary.all_companies || [];
+  const companies = (summary.all_companies || []).filter(c => c && c.length > 0);
   const mainCompany = companies.length > 0 ? companies[0] : '';
-
-  // キーワード情報
+  const clients = (summary.all_clients || []).filter(c => c && c.length > 0);
+  const mainClient = clients.length > 0 ? clients[0] : '';
+  const deadlines = summary.all_deadlines || [];
+  const mainDeadline = deadlines.length > 0 ? deadlines[0] : '';
+  const dates = summary.all_dates || [];
+  const eventDate = dates.length > 0 ? dates[0] : '';
+  const eventTypes = summary.all_event_types || [];
+  const eventType = eventTypes.length > 0 ? eventTypes[0] : '';
+  const novelties = summary.all_novelties || [];
+  const mainNovelty = novelties.length > 0 ? novelties[0] : '';
   const keywords = summary.all_keywords || [];
   const tags = keywords.join(', ');
-
-  // イベント種別の推定
-  const eventType = estimateEventType(keywords, data.slides);
-
-  // 実施時期の推定
-  const eventDate = estimateEventDate(data.slides);
+  const clientFromFilename = extractClientFromFilename(fileInfo.file_name || '');
 
   return {
     fileName: fileInfo.file_name || '',
@@ -145,16 +202,34 @@ function extractInfoFromJSON(data) {
     processedAt: fileInfo.processed_at || new Date().toISOString(),
     eventType: eventType,
     eventDate: eventDate,
+    mainClient: mainClient || clientFromFilename,
     mainCompany: mainCompany,
     allCompanies: companies.join(', '),
     avgPrice: avgPrice,
-    minPrice: minPrice,
-    maxPrice: maxPrice,
+    minPrice: prices.length > 0 ? Math.min(...prices) : null,
+    maxPrice: prices.length > 0 ? Math.max(...prices) : null,
     totalQuantity: totalQuantity,
+    mainDeadline: mainDeadline,
+    mainNovelty: mainNovelty,
     tags: tags,
-    slideTexts: extractAllTexts(data.slides),
-    confidenceScore: calculateConfidenceScore(data)
+    slideTexts: '',
+    confidenceScore: 0
   };
+}
+
+/**
+ * ファイル名からクライアント名を抽出
+ */
+function extractClientFromFilename(filename) {
+  // 【クライアント名様】パターン
+  const match1 = filename.match(/【([^】]+)様?】/);
+  if (match1) return match1[1];
+
+  // [クライアント名様]パターン
+  const match2 = filename.match(/\[([^\]]+)様?\]/);
+  if (match2) return match2[1];
+
+  return '';
 }
 
 /**
@@ -219,53 +294,54 @@ function extractAllTexts(slides) {
 }
 
 /**
- * 信頼度スコアを計算
+ * 信頼度スコアを計算（Gemini API版対応）
  */
 function calculateConfidenceScore(data) {
+  // Gemini API版はスコアが既に計算されている
+  if (data.gemini_analysis && data.gemini_analysis.confidence_score) {
+    return data.gemini_analysis.confidence_score;
+  }
+
+  // レガシー版の計算（後方互換性）
   let score = 0;
 
-  // ファイル情報があれば +20
   if (data.file_info) score += 20;
 
-  // 価格情報があれば +30
   if (data.summary && data.summary.all_prices && data.summary.all_prices.length > 0) {
     score += 30;
   }
 
-  // 会社情報があれば +25
   if (data.summary && data.summary.all_companies && data.summary.all_companies.length > 0) {
     score += 25;
   }
 
-  // キーワードがあれば +15
   if (data.summary && data.summary.all_keywords && data.summary.all_keywords.length > 0) {
     score += 15;
   }
 
-  // スライド数に応じて +10
   if (data.file_info && data.file_info.slide_count > 5) {
     score += 10;
   }
 
-  return Math.min(score, 100); // 最大100%
+  return Math.min(score, 100);
 }
 
 /**
- * スプレッドシート用にデータをフォーマット
+ * スプレッドシート用にデータをフォーマット（改善版）
  */
 function formatDataForSpreadsheet(info, fileName) {
   return [
     new Date(), // A: 登録日時
     '', // B: 担当者名（手動入力）
-    '', // C: クライアント名（後で手動入力）
+    info.mainClient, // C: クライアント名（自動抽出）
     info.eventDate, // D: 実施時期
     info.eventType, // E: イベント種別
     '', // F: 景品カテゴリ（後で分類）
-    '', // G: 具体的な景品名（後で入力）
+    info.mainNovelty, // G: 具体的な景品名（自動抽出）
     info.avgPrice, // H: 単価（平均）
     info.totalQuantity, // I: 発注数量
     '', // J: MOQ（後で入力）
-    '', // K: 納期（後で入力）
+    info.mainDeadline, // K: 納期（自動抽出）
     info.mainCompany, // L: 協力会社名
     '', // M: 協力会社評価（後で評価）
     '', // N: 会場名（後で入力）
@@ -276,7 +352,7 @@ function formatDataForSpreadsheet(info, fileName) {
     info.tags, // S: タグ
     info.confidenceScore, // T: 信頼度スコア
     fileName, // U: 元ファイル名
-    info.slideTexts, // V: 抽出テキスト（参考用）
+    info.slideTexts.substring(0, 500), // V: 抽出テキスト（500文字に制限）
     info.allCompanies // W: 全会社名
   ];
 }

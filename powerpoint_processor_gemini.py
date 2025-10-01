@@ -30,12 +30,20 @@ except ImportError:
 class GeminiPowerPointProcessor:
     """Gemini API統合PowerPoint解析クラス"""
 
-    def __init__(self, api_key: Optional[str] = None):
+    # 無料枠の制限（Flash-Lite）
+    FREE_TIER_LIMITS = {
+        'daily_requests': 1000,      # 1日1,000回
+        'monthly_requests': 30000,    # 月間30,000回
+        'rpm': 15                     # 1分間15回
+    }
+
+    def __init__(self, api_key: Optional[str] = None, usage_log_path: Optional[str] = None):
         """
         初期化
 
         Args:
             api_key: Gemini APIキー（省略時は環境変数から取得）
+            usage_log_path: 使用状況ログファイルパス（省略時は.gemini_usage.json）
         """
         # APIキーの設定
         self.api_key = api_key or os.environ.get('GEMINI_API_KEY')
@@ -45,11 +53,99 @@ class GeminiPowerPointProcessor:
                 "Set GEMINI_API_KEY environment variable or pass api_key parameter."
             )
 
+        # 使用状況ログの設定
+        self.usage_log_path = usage_log_path or Path.home() / '.gemini_usage.json'
+        self.usage_data = self._load_usage_data()
+
         # Gemini APIの初期化
         genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        # 無料版推奨モデル: Flash-Lite (1日1,000回、月30,000回まで)
+        self.model = genai.GenerativeModel('gemini-2.0-flash-lite')
 
-        print("Gemini API initialized successfully")
+        print("Gemini API initialized successfully (using gemini-2.0-flash-lite)")
+        self._print_usage_status()
+
+    def _load_usage_data(self) -> Dict[str, Any]:
+        """使用状況データを読み込み"""
+        if Path(self.usage_log_path).exists():
+            try:
+                with open(self.usage_log_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                pass
+
+        # 初期データ
+        return {
+            'daily': {},
+            'monthly': {},
+            'total': 0
+        }
+
+    def _save_usage_data(self):
+        """使用状況データを保存"""
+        try:
+            with open(self.usage_log_path, 'w', encoding='utf-8') as f:
+                json.dump(self.usage_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"WARNING: Failed to save usage data: {e}")
+
+    def _check_free_tier_limit(self) -> bool:
+        """無料枠の制限チェック（超過したらFalseを返す）"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        this_month = datetime.now().strftime('%Y-%m')
+
+        # 日次使用量
+        daily_count = self.usage_data['daily'].get(today, 0)
+        if daily_count >= self.FREE_TIER_LIMITS['daily_requests']:
+            print(f"\n⚠️  FREE TIER LIMIT EXCEEDED: Daily limit ({self.FREE_TIER_LIMITS['daily_requests']} requests/day)")
+            print(f"   Today's usage: {daily_count}/{self.FREE_TIER_LIMITS['daily_requests']}")
+            print(f"   システムを停止します（無料枠超過のため課金を防止）")
+            return False
+
+        # 月次使用量
+        monthly_count = self.usage_data['monthly'].get(this_month, 0)
+        if monthly_count >= self.FREE_TIER_LIMITS['monthly_requests']:
+            print(f"\n⚠️  FREE TIER LIMIT EXCEEDED: Monthly limit ({self.FREE_TIER_LIMITS['monthly_requests']} requests/month)")
+            print(f"   This month's usage: {monthly_count}/{self.FREE_TIER_LIMITS['monthly_requests']}")
+            print(f"   システムを停止します（無料枠超過のため課金を防止）")
+            return False
+
+        return True
+
+    def _increment_usage(self):
+        """使用回数をカウント"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        this_month = datetime.now().strftime('%Y-%m')
+
+        # 日次カウント
+        self.usage_data['daily'][today] = self.usage_data['daily'].get(today, 0) + 1
+
+        # 月次カウント
+        self.usage_data['monthly'][this_month] = self.usage_data['monthly'].get(this_month, 0) + 1
+
+        # 総カウント
+        self.usage_data['total'] = self.usage_data.get('total', 0) + 1
+
+        # 保存
+        self._save_usage_data()
+
+    def _print_usage_status(self):
+        """現在の使用状況を表示"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        this_month = datetime.now().strftime('%Y-%m')
+
+        daily_count = self.usage_data['daily'].get(today, 0)
+        monthly_count = self.usage_data['monthly'].get(this_month, 0)
+        total_count = self.usage_data.get('total', 0)
+
+        daily_remaining = self.FREE_TIER_LIMITS['daily_requests'] - daily_count
+        monthly_remaining = self.FREE_TIER_LIMITS['monthly_requests'] - monthly_count
+
+        print(f"\n📊 FREE TIER USAGE STATUS:")
+        print(f"   Today: {daily_count}/{self.FREE_TIER_LIMITS['daily_requests']} requests (残り {daily_remaining})")
+        print(f"   This month: {monthly_count}/{self.FREE_TIER_LIMITS['monthly_requests']} requests (残り {monthly_remaining})")
+        print(f"   Total: {total_count} requests")
+        print()
 
     def extract_text_from_slide(self, slide) -> List[str]:
         """スライドからテキストを抽出"""
@@ -106,6 +202,12 @@ class GeminiPowerPointProcessor:
         Returns:
             構造化された分析結果
         """
+        # 無料枠チェック
+        if not self._check_free_tier_limit():
+            error_result = self._get_empty_analysis()
+            error_result['error'] = 'FREE_TIER_LIMIT_EXCEEDED'
+            return error_result
+
         # テキストを結合
         combined_text = "\n\n".join(slide_texts)
 
@@ -162,6 +264,9 @@ class GeminiPowerPointProcessor:
             # Gemini APIに送信
             print("  Sending to Gemini API...")
             response = self.model.generate_content(prompt)
+
+            # API使用回数をカウント（成功したらカウント）
+            self._increment_usage()
 
             # レスポンスからJSONを抽出
             response_text = response.text.strip()
