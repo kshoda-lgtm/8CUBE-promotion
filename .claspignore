@@ -1,0 +1,13 @@
+# clasp ignore file
+# Only push Code.gs and appsscript.json
+
+*.md
+*.py
+*.txt
+*.zip
+.git*
+AIマニュアル化/
+Create_Form.js
+Integrated_Form_to_Markdown.js
+Form_to_Markdown.js
+JSON_processor.js
